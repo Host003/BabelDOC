@@ -1,6 +1,8 @@
 import logging
 import random
 import re
+import statistics
+import unicodedata
 
 import numpy as np
 
@@ -41,6 +43,57 @@ logger = logging.getLogger(__name__)
 
 # Base58 alphabet (Bitcoin style, without numbers 0, O, I, l)
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+# ---- Table of Contents (TOC) line detection ----
+# 连续点引导符（兼容旧的目录识别规则）
+TOC_DOT_LEADER_REGEX = re.compile(r"\.{20,}")
+# 带间隔的点引导符中点的最少数量（如 ". . . . ."）
+TOC_SPACED_DOT_MIN_COUNT = 8
+# 一个多行段落被判定为目录所需的最少条目行数
+TOC_MIN_ENTRY_LINES = 3
+# 条目行数占全部行的最低比例
+TOC_MIN_ENTRY_RATIO = 0.6
+# 各条目尾部页码右边缘对齐容差（pt）
+TOC_NUMBER_RIGHT_EDGE_TOLERANCE = 8.0
+# 标题与页码之间水平空隙的最小绝对距离（pt）
+TOC_MIN_GAP = 10.0
+# 标题与页码之间空隙相对行内空格宽度的倍数
+TOC_GAP_SPACE_WIDTH_FACTOR = 4.5
+# 阿拉伯页码最大位数
+TOC_MAX_PAGE_DIGITS = 4
+# 罗马页码（如 iii、xiv）
+TOC_ROMAN_NUMERAL_REGEX = re.compile(
+    r"^m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})$",
+    re.IGNORECASE,
+)
+TOC_MAX_ROMAN_LEN = 6
+# 引导点/省略号字符（翻译输出中可能出现的点线字符）
+TOC_LEADER_CHARS = (".", "．", "…", "·", "‧", "⋅")
+
+
+def is_toc_separator_char(ch: str | None) -> bool:
+    """空格、零宽字符等不参与标题/页码内容判定的分隔字符。"""
+    if not ch:
+        return True
+    if ch.isspace():
+        return True
+    return unicodedata.category(ch) == "Cf"
+
+
+def is_toc_leader_char(ch: str | None) -> bool:
+    """点引导符字符（各种形态的句点/中点/省略号）。"""
+    return bool(ch) and ch in TOC_LEADER_CHARS
+
+
+def is_toc_page_number_token(text: str) -> bool:
+    """判断文本是否为目录页码（阿拉伯数字或罗马数字）。"""
+    if not text:
+        return False
+    if text.isdigit():
+        return len(text) <= TOC_MAX_PAGE_DIGITS
+    if len(text) <= TOC_MAX_ROMAN_LEN:
+        return bool(TOC_ROMAN_NUMERAL_REGEX.match(text))
+    return False
 
 
 def generate_base58_id(length: int = 5) -> str:
@@ -289,6 +342,11 @@ class ParagraphFinder:
         # 新增后处理：合并带行号交替的正文段落（a 正文、b 行号、c 正文 -> 合并 a 与 c，保留 b）
         if getattr(self.translation_config, "merge_alternating_line_numbers", True):
             self.merge_alternating_line_number_paragraphs(paragraphs)
+
+        # 新增后处理：将目录（TOC）段落按条目拆分为独立段落，
+        # 避免所有目录条目被合并成一个连续大段而丢失换行与缩进
+        if getattr(self.translation_config, "split_toc_lines", True):
+            self.split_toc_paragraphs(paragraphs)
 
         for paragraph in paragraphs:
             self.update_paragraph_data(paragraph, update_unicode=True)
@@ -859,36 +917,9 @@ class ParagraphFinder:
 
                 prev_line = prev_composition.pdf_line
                 prev_width = prev_line.box.x2 - prev_line.box.x
-                prev_text = "".join([c.char_unicode for c in prev_line.pdf_character])
-
-                # 检查是否包含连续的点（至少 20 个）
-                # 如果有至少连续 20 个点，则代表这是目录条目
-                if re.search(r"\.{20,}", prev_text):
-                    # 创建新的段落
-                    new_paragraph = PdfParagraph(
-                        box=Box(0, 0, 0, 0),  # 临时边界框
-                        pdf_paragraph_composition=(
-                            paragraph.pdf_paragraph_composition[j:]
-                        ),
-                        unicode="",
-                        debug_id=generate_base58_id(),
-                        layout_label=paragraph.layout_label,
-                        layout_id=paragraph.layout_id,
-                    )
-                    # 更新原段落
-                    paragraph.pdf_paragraph_composition = (
-                        paragraph.pdf_paragraph_composition[:j]
-                    )
-
-                    # 更新两个段落的数据
-                    self.update_paragraph_data(paragraph)
-                    self.update_paragraph_data(new_paragraph)
-
-                    # 在原段落后插入新段落
-                    paragraphs.insert(i + 1, new_paragraph)
-                    break
 
                 # 如果前一行宽度小于中位数的一半，将当前行及后续行分割成新段落
+                # 注意：目录条目的拆分统一由 split_toc_paragraphs 处理
                 if (
                     self.translation_config.split_short_lines
                     and prev_width
@@ -926,6 +957,223 @@ class ParagraphFinder:
                     break
                 j += 1
             i += 1
+
+    def _analyze_toc_entry_line(self, line: PdfLine) -> dict | None:
+        """判断一行是否为目录条目（标题 + 大段空隙/点引导符 + 页码）。
+
+        典型目录行形如 "1.2.3 Some Title ........ 12"、
+        "Foreword ........ iii" 或
+        "1.2.3 Some Title              12"（页码右对齐、中间为空白）。
+        仅靠句点无法识别空白引导（引导点也可能是图形而非文本），
+        因此同时依据“行尾页码（阿拉伯/罗马数字）+ 与标题之间存在
+        大水平空隙 + 多行页码右边缘对齐”的几何特征判断。
+
+        Returns:
+            包含条目几何信息的 dict；不是候选条目时返回 None。
+        """
+        chars = line.pdf_character
+        if len(chars) < 2 or any(c.visual_bbox is None for c in chars):
+            return None
+
+        ordered = sorted(chars, key=lambda c: c.visual_bbox.box.x)
+        text = "".join(c.char_unicode or "" for c in ordered)
+
+        # 1. 行尾页码（忽略尾部空格/零宽字符），支持阿拉伯与罗马数字
+        i = len(ordered)
+        while i > 0 and is_toc_separator_char(ordered[i - 1].char_unicode):
+            i -= 1
+        j = i
+        while j > 0:
+            ch = ordered[j - 1].char_unicode or ""
+            if ch.isdigit() or ("a" <= ch.lower() <= "z"):
+                j -= 1
+            else:
+                break
+        number_chars = ordered[j:i]
+        number_text = "".join(c.char_unicode or "" for c in number_chars)
+        if not is_toc_page_number_token(number_text):
+            return None
+
+        # 2. 页码之前必须有标题文字（跳过页码与标题之间的分隔字符
+        #    与引导点，使两种引导符共用同一套空隙计算）
+        k = j
+        while k > 0 and (
+            is_toc_separator_char(ordered[k - 1].char_unicode)
+            or is_toc_leader_char(ordered[k - 1].char_unicode)
+        ):
+            k -= 1
+        if k == 0:
+            return None  # 纯页码行
+        title_chars = ordered[:k]
+        if not any((c.char_unicode or "").isalpha() for c in title_chars):
+            return None
+
+        # 3. 点引导符（连续点或间隔点），不依赖空隙大小
+        has_dot_leader = bool(TOC_DOT_LEADER_REGEX.search(text)) or (
+            text.count(".") >= TOC_SPACED_DOT_MIN_COUNT
+        )
+
+        # 4. 标题末字符与页码首字符之间的水平空隙
+        number_x0 = min(c.visual_bbox.box.x for c in number_chars)
+        number_x2 = max(c.visual_bbox.box.x2 for c in number_chars)
+        last_title_char = title_chars[-1]
+        gap = number_x0 - last_title_char.visual_bbox.box.x2
+
+        # 以行内空格宽度估计“正常词间距”，避免不同字号下阈值失真
+        space_widths = [
+            c.visual_bbox.box.x2 - c.visual_bbox.box.x
+            for c in title_chars
+            if c.char_unicode == " "
+            and c.visual_bbox.box.x2 > c.visual_bbox.box.x
+        ]
+        if space_widths:
+            space_width = statistics.median(space_widths)
+        else:
+            font_sizes = [
+                getattr(c.pdf_style, "font_size", None) for c in title_chars
+            ]
+            font_sizes = [s for s in font_sizes if s]
+            space_width = statistics.median(font_sizes) * 0.27 if font_sizes else 2.5
+        gap_threshold = max(
+            TOC_MIN_GAP,
+            TOC_GAP_SPACE_WIDTH_FACTOR * space_width,
+        )
+
+        return {
+            "has_dot_leader": has_dot_leader,
+            "big_gap": gap >= gap_threshold,
+            "number_x2": number_x2,
+            "number_text": number_text,
+        }
+
+    def split_toc_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """将目录（TOC）多行段落拆分为“每条目一个段落”。
+
+        判定需要整段满足：
+        - 至少 ``TOC_MIN_ENTRY_LINES`` 行被识别为目录条目；
+        - 条目行占比不低于 ``TOC_MIN_ENTRY_RATIO``；
+        - 基于空隙的条目，其尾部页码右边缘需基本对齐。
+
+        拆分在每个条目行之前进行；条目之间的非条目行（如过长标题的
+        折行）附加到上一个条目段落中；首个条目之前的标题行独立成段。
+        """
+        idx = 0
+        while idx < len(paragraphs):
+            paragraph = paragraphs[idx]
+            compositions = paragraph.pdf_paragraph_composition
+            line_indexes = [
+                ci
+                for ci, comp in enumerate(compositions)
+                if comp.pdf_line is not None
+            ]
+            if not line_indexes:
+                idx += 1
+                continue
+
+            infos = [
+                self._analyze_toc_entry_line(compositions[ci].pdf_line)
+                for ci in line_indexes
+            ]
+
+            # 单行段落：本身就是一个完整条目，只需打标记供排版右对齐页码。
+            # 点引导符足够特异；空白引导则要求页码贴近本行右边缘。
+            if len(line_indexes) == 1:
+                info = infos[0]
+                if info is not None and (
+                    info["has_dot_leader"]
+                    or (
+                        info["big_gap"]
+                        and paragraph.box is not None
+                        and abs(info["number_x2"] - paragraph.box.x2)
+                        <= TOC_NUMBER_RIGHT_EDGE_TOLERANCE
+                    )
+                ):
+                    paragraph.toc_page_number = info["number_text"]
+                    paragraph.toc_page_number_x2 = info["number_x2"]
+                    paragraph.toc_dot_leader = info["has_dot_leader"]
+                idx += 1
+                continue
+
+            # 页码右边缘对齐校验（仅针对大空隙候选行）
+            gap_candidates = [
+                li
+                for li, info in enumerate(infos)
+                if info is not None and info["big_gap"]
+            ]
+            edge_confirmed: set[int] = set()
+            if gap_candidates:
+                edge_x2 = statistics.median(
+                    infos[li]["number_x2"] for li in gap_candidates
+                )
+                for li in gap_candidates:
+                    if (
+                        abs(infos[li]["number_x2"] - edge_x2)
+                        <= TOC_NUMBER_RIGHT_EDGE_TOLERANCE
+                    ):
+                        edge_confirmed.add(li)
+
+            entry_flags = [False] * len(line_indexes)
+            for li, info in enumerate(infos):
+                if info is None:
+                    continue
+                if info["has_dot_leader"] or li in edge_confirmed:
+                    entry_flags[li] = True
+
+            entry_count = sum(entry_flags)
+            if entry_count < TOC_MIN_ENTRY_LINES or (
+                entry_count / len(line_indexes) < TOC_MIN_ENTRY_RATIO
+            ):
+                idx += 1
+                continue
+
+            # 按条目切分 composition；记录每个分组首条目录行的页码信息
+            groups: list[tuple[list[PdfParagraphComposition], dict | None]] = []
+            current: list[PdfParagraphComposition] = []
+            current_info: dict | None = None
+            line_cursor = -1
+            for comp in compositions:
+                if comp.pdf_line is not None:
+                    line_cursor += 1
+                    if entry_flags[line_cursor]:
+                        if current:
+                            groups.append((current, current_info))
+                        current = [comp]
+                        current_info = infos[line_cursor]
+                        continue
+                current.append(comp)
+            if current:
+                groups.append((current, current_info))
+
+            if len(groups) < 2:
+                idx += 1
+                continue
+
+            new_paragraphs: list[PdfParagraph] = []
+            for group, entry_info in groups:
+                new_paragraph = PdfParagraph(
+                    box=Box(0, 0, 0, 0),  # 临时边界框，稍后重算
+                    pdf_paragraph_composition=group,
+                    unicode="",
+                    debug_id=generate_base58_id(),
+                    layout_label=paragraph.layout_label,
+                    layout_id=paragraph.layout_id,
+                )
+                if entry_info is not None:
+                    # 标记为目录条目，供排版阶段强制页码右对齐
+                    new_paragraph.toc_page_number = entry_info["number_text"]
+                    new_paragraph.toc_page_number_x2 = entry_info["number_x2"]
+                    new_paragraph.toc_dot_leader = entry_info["has_dot_leader"]
+                self.update_paragraph_data(new_paragraph)
+                new_paragraphs.append(new_paragraph)
+
+            logger.debug(
+                "Split TOC paragraph %s into %d entry paragraphs on page %s",
+                paragraph.debug_id,
+                len(new_paragraphs),
+                paragraph.box,
+            )
+            paragraphs[idx : idx + 1] = new_paragraphs
+            idx += len(new_paragraphs)
 
     @staticmethod
     def is_bbox_contain_in_vertical(bbox1: Box, bbox2: Box) -> bool:
