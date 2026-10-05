@@ -1329,13 +1329,21 @@ class Typesetting:
                     i -= 1
                 else:
                     break
-            matched = (
-                "".join(
-                    typesetting_units[k].try_get_unicode()
-                    for k in reversed(number_rev)
-                )
-                == page_number_token
+            full_digits = "".join(
+                typesetting_units[k].try_get_unicode()
+                for k in reversed(number_rev)
             )
+            if full_digits == page_number_token:
+                matched = True
+            elif len(full_digits) > len(page_number_token) and full_digits.endswith(
+                page_number_token
+            ):
+                # 尾部数字串以页码结尾（如标题年份与页码被模型连成 26136）：
+                # 仅把页码后缀纳入钉入范围，前缀保留在标题中
+                matched = True
+                number_rev = number_rev[: len(page_number_token)]
+            else:
+                matched = False
         else:
             while i >= 0:
                 ch = typesetting_units[i].try_get_unicode()
@@ -1475,6 +1483,56 @@ class Typesetting:
                 typesetting_units,
                 paragraph.toc_page_number,
             )
+            # 模型偶尔会漏译尾部页码（如长标题后 136 丢失）。
+            # 页码来自原 PDF 的几何识别，可在排版时补回，保证右对齐布局完整。
+            if toc_plan is None:
+                template_unit = next(
+                    (
+                        u
+                        for u in reversed(typesetting_units)
+                        if u.unicode is not None and u.style is not None
+                    ),
+                    None,
+                )
+                if template_unit is not None:
+                    appended = []
+                    for ch in paragraph.toc_page_number:
+                        appended.append(
+                            TypesettingUnit(
+                                unicode=ch,
+                                font=self.font_mapper.map(
+                                    template_unit.original_font, ch
+                                ),
+                                original_font=template_unit.original_font,
+                                font_size=template_unit.font_size,
+                                style=template_unit.style,
+                                xobj_id=template_unit.xobj_id,
+                            )
+                        )
+                    if appended:
+                        # 直接以追加单元作为页码构造布局计划，避免重新扫描时
+                        # 与标题尾部的数字（如年份“26”）连成 26136 之类的
+                        # 错误 token；页码前原有的空格/点引导符仍予以吸收。
+                        base_len = len(typesetting_units)
+                        typesetting_units = [*typesetting_units, *appended]
+                        number_indices = set(
+                            range(base_len, base_len + len(appended))
+                        )
+                        gap_indices: set[int] = set()
+                        gi = base_len - 1
+                        while gi >= 0:
+                            ch = typesetting_units[gi].try_get_unicode()
+                            if ch is not None and (
+                                ch.isspace() or ch in (".", "．", "…", "·", "‧", "⋅")
+                            ):
+                                gap_indices.add(gi)
+                                gi -= 1
+                            else:
+                                break
+                        toc_plan = {
+                            "number": number_indices,
+                            "gap": gap_indices,
+                        }
         toc_can_pin = toc_plan is not None
         toc_pinned = False
 

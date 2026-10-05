@@ -48,7 +48,7 @@ BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 # 连续点引导符（兼容旧的目录识别规则）
 TOC_DOT_LEADER_REGEX = re.compile(r"\.{20,}")
 # 带间隔的点引导符中点的最少数量（如 ". . . . ."）
-TOC_SPACED_DOT_MIN_COUNT = 8
+TOC_SPACED_DOT_MIN_COUNT = 4
 # 一个多行段落被判定为目录所需的最少条目行数
 TOC_MIN_ENTRY_LINES = 3
 # 条目行数占全部行的最低比例
@@ -69,6 +69,8 @@ TOC_ROMAN_NUMERAL_REGEX = re.compile(
 TOC_MAX_ROMAN_LEN = 6
 # 引导点/省略号字符（翻译输出中可能出现的点线字符）
 TOC_LEADER_CHARS = (".", "．", "…", "·", "‧", "⋅")
+# 同一个 PdfLine 内多个视觉行的最小纵向间距（目录行距通常 >12pt）
+TOC_VISUAL_BAND_MIN_GAP = 6.0
 
 
 def is_toc_separator_char(ch: str | None) -> bool:
@@ -971,7 +973,10 @@ class ParagraphFinder:
         Returns:
             包含条目几何信息的 dict；不是候选条目时返回 None。
         """
-        chars = line.pdf_character
+        return self._analyze_toc_entry_chars(line.pdf_character)
+
+    def _analyze_toc_entry_chars(self, chars) -> dict | None:
+        """字符序列版本的目录条目判定（供视觉行拆分后复用）。"""
         if len(chars) < 2 or any(c.visual_bbox is None for c in chars):
             return None
 
@@ -1046,6 +1051,43 @@ class ParagraphFinder:
             "number_text": number_text,
         }
 
+    def _split_line_visual_bands(self, line: PdfLine) -> tuple[list[PdfLine], bool]:
+        """把一个 PdfLine 中被错误合并的多个视觉行按 y 坐标带拆开。
+
+        部分 PDF（如澳大利亚预算文件目录）相邻视觉行的字符框纵向重叠，
+        ``_split_paragraph_into_lines`` 会把多条目录行并入同一个 PdfLine，
+        表现为行内字符存在多个相距约 13pt 的 y 值。按
+        ``TOC_VISUAL_BAND_MIN_GAP`` 聚类为自上而下的多个视觉行，各自行内
+        再按 x 排序；无法拆分时原样返回。
+        """
+        chars = line.pdf_character
+        if len(chars) < 2 or any(c.box is None for c in chars):
+            return [line], False
+        # 注意必须用字符布局框 box（同一视觉行内各字符的 box.y 一致），
+        # 不能用墨迹框 visual_bbox——其 y 随字形（大写/小写/句点）变化，
+        # 会把同一行的字符撕碎。
+        ordered = sorted(
+            chars,
+            key=lambda c: (-c.box.y, c.box.x),
+        )
+        bands: list[list[PdfCharacter]] = []
+        anchor_y = None
+        for ch in ordered:
+            y = ch.box.y
+            if anchor_y is None or abs(y - anchor_y) >= TOC_VISUAL_BAND_MIN_GAP:
+                bands.append([ch])
+                anchor_y = y
+            else:
+                bands[-1].append(ch)
+        if len(bands) == 1:
+            return [line], False
+        band_lines = []
+        for band_chars in bands:
+            band_line = PdfLine(pdf_character=band_chars)
+            self.update_line_data(band_line)
+            band_lines.append(band_line)
+        return band_lines, True
+
     def split_toc_paragraphs(self, paragraphs: list[PdfParagraph]):
         """将目录（TOC）多行段落拆分为“每条目一个段落”。
 
@@ -1061,23 +1103,29 @@ class ParagraphFinder:
         while idx < len(paragraphs):
             paragraph = paragraphs[idx]
             compositions = paragraph.pdf_paragraph_composition
-            line_indexes = [
-                ci
-                for ci, comp in enumerate(compositions)
-                if comp.pdf_line is not None
-            ]
-            if not line_indexes:
+            if not compositions or any(
+                comp.pdf_line is None for comp in compositions
+            ):
                 idx += 1
                 continue
 
+            # 先把被错误合并到同一 PdfLine 的多个视觉行按 y 坐标带拆开，
+            # 得到按阅读顺序排列的“视觉行”序列（每个视觉行即一个目录条目）
+            visual_lines: list[PdfLine] = []
+            any_band_split = False
+            for comp in compositions:
+                band_lines, expanded = self._split_line_visual_bands(comp.pdf_line)
+                visual_lines.extend(band_lines)
+                any_band_split = any_band_split or expanded
+
             infos = [
-                self._analyze_toc_entry_line(compositions[ci].pdf_line)
-                for ci in line_indexes
+                self._analyze_toc_entry_line(visual_lines[vi])
+                for vi in range(len(visual_lines))
             ]
 
-            # 单行段落：本身就是一个完整条目，只需打标记供排版右对齐页码。
+            # 单个视觉行：本身就是一个完整条目，只需打标记供排版右对齐页码。
             # 点引导符足够特异；空白引导则要求页码贴近本行右边缘。
-            if len(line_indexes) == 1:
+            if len(visual_lines) == 1:
                 info = infos[0]
                 if info is not None and (
                     info["has_dot_leader"]
@@ -1096,51 +1144,55 @@ class ParagraphFinder:
 
             # 页码右边缘对齐校验（仅针对大空隙候选行）
             gap_candidates = [
-                li
-                for li, info in enumerate(infos)
+                vi
+                for vi, info in enumerate(infos)
                 if info is not None and info["big_gap"]
             ]
             edge_confirmed: set[int] = set()
             if gap_candidates:
                 edge_x2 = statistics.median(
-                    infos[li]["number_x2"] for li in gap_candidates
+                    infos[vi]["number_x2"] for vi in gap_candidates
                 )
-                for li in gap_candidates:
+                for vi in gap_candidates:
                     if (
-                        abs(infos[li]["number_x2"] - edge_x2)
+                        abs(infos[vi]["number_x2"] - edge_x2)
                         <= TOC_NUMBER_RIGHT_EDGE_TOLERANCE
                     ):
-                        edge_confirmed.add(li)
+                        edge_confirmed.add(vi)
 
-            entry_flags = [False] * len(line_indexes)
-            for li, info in enumerate(infos):
+            entry_flags = [False] * len(visual_lines)
+            for vi, info in enumerate(infos):
                 if info is None:
                     continue
-                if info["has_dot_leader"] or li in edge_confirmed:
-                    entry_flags[li] = True
+                if info["has_dot_leader"] or vi in edge_confirmed:
+                    entry_flags[vi] = True
 
             entry_count = sum(entry_flags)
-            if entry_count < TOC_MIN_ENTRY_LINES or (
-                entry_count / len(line_indexes) < TOC_MIN_ENTRY_RATIO
-            ):
+            ratio_ok = entry_count / len(visual_lines) >= TOC_MIN_ENTRY_RATIO
+            # 普通多行段落沿用“至少 3 个条目”的保守阈值；
+            # 若检测到 PdfLine 内部确有多视觉行被合并，该几何证据本身很强，
+            # 放宽为至少 2 个条目（如只有 2 行的图表列表）。
+            enough_entries = (
+                entry_count >= TOC_MIN_ENTRY_LINES
+                if not any_band_split
+                else entry_count >= 2
+            )
+            if not ratio_ok or not enough_entries:
                 idx += 1
                 continue
 
-            # 按条目切分 composition；记录每个分组首条目录行的页码信息
-            groups: list[tuple[list[PdfParagraphComposition], dict | None]] = []
-            current: list[PdfParagraphComposition] = []
+            # 按条目切分视觉行；非条目行（如过长标题的折行）附加到上一条目
+            groups: list[tuple[list[PdfLine], dict | None]] = []
+            current: list[PdfLine] = []
             current_info: dict | None = None
-            line_cursor = -1
-            for comp in compositions:
-                if comp.pdf_line is not None:
-                    line_cursor += 1
-                    if entry_flags[line_cursor]:
-                        if current:
-                            groups.append((current, current_info))
-                        current = [comp]
-                        current_info = infos[line_cursor]
-                        continue
-                current.append(comp)
+            for vi, line in enumerate(visual_lines):
+                if entry_flags[vi]:
+                    if current:
+                        groups.append((current, current_info))
+                    current = [line]
+                    current_info = infos[vi]
+                else:
+                    current.append(line)
             if current:
                 groups.append((current, current_info))
 
@@ -1149,7 +1201,11 @@ class ParagraphFinder:
                 continue
 
             new_paragraphs: list[PdfParagraph] = []
-            for group, entry_info in groups:
+            for group_lines, entry_info in groups:
+                group = [
+                    PdfParagraphComposition(pdf_line=group_line)
+                    for group_line in group_lines
+                ]
                 new_paragraph = PdfParagraph(
                     box=Box(0, 0, 0, 0),  # 临时边界框，稍后重算
                     pdf_paragraph_composition=group,
@@ -1157,6 +1213,7 @@ class ParagraphFinder:
                     debug_id=generate_base58_id(),
                     layout_label=paragraph.layout_label,
                     layout_id=paragraph.layout_id,
+                    xobj_id=paragraph.xobj_id,
                 )
                 if entry_info is not None:
                     # 标记为目录条目，供排版阶段强制页码右对齐
